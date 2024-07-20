@@ -167,6 +167,7 @@ pub struct Account {
 }
 
 impl Account {
+    // TODO: make this functoin clearer and smaller
     pub fn process(&mut self, tx: Transaction) {
         if self.is_locked {
             return;
@@ -298,7 +299,6 @@ impl Account {
                 }
             }
         }
-        // Is it better to move the transaction here?
         self.transactions.insert(tx.tx, tx.clone());
     }
 

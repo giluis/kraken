@@ -144,10 +144,7 @@ fn round_equals(first: f64, second: f64) -> bool {
 
 #[cfg(test)]
 mod integration_tests {
-    use crate::{
-        model::{ClientId, Transaction},
-        ClientAccounts,
-    };
+    use crate::ClientAccounts;
 
     use super::test_cases::*;
     use std::process::Command;
