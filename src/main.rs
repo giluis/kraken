@@ -1,17 +1,32 @@
 #![feature(hash_set_entry)]
+#![feature(iter_intersperse)]
+#![feature(concat_idents)]
 use std::{
-    collections::{HashMap, HashSet}, fs::File, hash::Hash, io::{stdout, BufRead, BufReader}, num::ParseFloatError, str::FromStr
+    collections::{HashMap, HashSet},
+    fs::File,
+    hash::Hash,
+    io::{stdout, BufRead, BufReader, Write},
+    num::{ParseFloatError, ParseIntError},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
 };
 
 use csv::Writer;
+use futures::{stream, StreamExt};
 use serde::Serializer;
 use serde_derive::{Deserialize, Serialize};
+use tokio::{
+    io::DuplexStream,
+    sync::{Mutex, RwLock}, task::JoinHandle,
+};
+
+type TokioSender<T> = tokio::sync::mpsc::Sender<T>;
+
 
 // TODO: explore cache-friendlier alternatives
 //      perhaps a matrix that covered all the transactions that happnned X seconds ago, where X the typicall amount that disputes occurs
-// TODO: dispute, resolve, and cashback tx
-//       handle tx_ids differently than deposit and withdrawals
-//       perhaps auto generate the required IDs
+// TODO: Explain that dispute, resolve, and cashback are not stored, because they have no id
 // TODO: sinalize which transactions have gone wrong with errors
 // TODO: use faster hashmaps
 // TODO: document what would be a better data model for dispute
@@ -21,33 +36,141 @@ use serde_derive::{Deserialize, Serialize};
 // TODO: explain decision regarding disputes for withdrawals
 // resolves should increment held and decrement available. this is applicable to disputes
 // assignment is not clear on what to do this
+// TODO: explain lack of Serde
 
-fn main() {
-    let f = File::open("input_file.csv").unwrap();
-    let a = BufReader::new(f);
-    let mut accounts = ClientAccounts::new();
-    for l in a.lines(){
-        let tx = l.unwrap().parse().unwrap(); 
-        accounts.process(&tx);
-    }
-    println!("{}", accounts);
-}
+#[tokio::main]
+async fn main() {
+    let file_name = std::env::args().nth(1).unwrap();
+    let f = File::open(file_name).unwrap();
+    let reader = BufReader::new(f);
+    let lines = reader.lines().skip(1);
 
-#[derive(Debug, PartialEq)]
-struct ClientAccounts {
-    clients: HashMap<ClientId, Account>,
-}
+    let mut accounts = HashMap::<
+        ClientId,
+        (
+            TokioSender<String>,
+            JoinHandle<Account>,
+        ),
+    >::new();
 
-impl ClientAccounts {
-    fn consume_all(&mut self, txs: &[Transaction]) {
-        for t in txs {
-            self.process(t)
+    for l in lines {
+        let l = l.unwrap();
+        let id = get_id(&l);
+        if let Some((sender, _)) = accounts.get(&id) {
+            match sender.send(l).await {
+                Ok(_) => (),
+                Err(_) => todo!("What errors cna be thrown?"),
+            }
+        } else {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(100);
+            accounts.insert(
+                id,
+                (
+                    sender.clone(),
+                    tokio::spawn(async move {
+                        let mut account = Account::empty();
+                        loop {
+                            match receiver.recv().await {
+                                Some(tx_str) => {
+                                    let tx = tx_str.parse().unwrap();
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                    account.process(tx);
+                                }
+                                None => break,
+                            }
+                        }
+                        account
+                    }),
+                ),
+            );
+            match sender.send(l).await {
+                Ok(_) => (),
+                Err(_) => todo!("What errors cna be thrown?"),
+            }
         }
+
+        // handles.push(tokio::spawn(async move {
+        //     let tx = l.parse().unwrap();
+        //     let mut h = handler_arc.lock().await;
+        //     h.process(&tx);
+        //     // drop(h);
+        //     // tokio::time::sleep(Duration::from_secs(10)).await;
+        //     // std::thread::sleep(Duration::from_secs(10));
+        // }));
     }
 
+    let mut result = vec![];
+    for (i, (s, handle)) in accounts {
+        // let _r = s.send(Message::CloseChannel).await ;
+        drop(s);
+        result.push((i, handle.await.unwrap()));
+    }
+
+
+    let _ = stdout().write(print_results(result).as_bytes()).unwrap();
+}
+
+
+
+fn print_results(accounts: Vec<(ClientId, Account)>) -> String {
+    let mut result = format!("client, available, held, total, locked\n");
+    for (id, account) in accounts{
+        // using debug implementatoin of ClientId, might be antipattern
+        result += &format!( "{:?}, {}\n", id.0, account);
+    }
+    result
+}
+
+fn get_id(line: &str) -> ClientId {
+    line.split(',').nth(1).unwrap().parse().unwrap()
+}
+
+#[derive(Debug)]
+struct AccountHandler {
+    clients: HashMap<ClientId, (TokioSender<String>, JoinHandle<Account>)>,
+}
+
+impl AccountHandler {
     fn new() -> Self {
         Self {
             clients: HashMap::new(),
+        }
+    }
+
+    async fn process(&mut self, tx_str: &str) {
+        let id = get_id(tx_str);
+        self.clients.entry(&id)
+        if let Some((sender, _)) = self.clients.get(&id) {
+            match sender.send(l).await {
+                Ok(_) => (),
+                Err(_) => todo!("What errors cna be thrown?"),
+            }
+        } else {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(100);
+            accounts.insert(
+                id,
+                (
+                    sender.clone(),
+                    tokio::spawn(async move {
+                        let mut account = Account::empty();
+                        loop {
+                            match receiver.recv().await {
+                                Some(tx_str) => {
+                                    let tx = tx_str.parse().unwrap();
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                    account.process(tx);
+                                }
+                                None => break,
+                            }
+                        }
+                        account
+                    }),
+                ),
+            );
+            match sender.send(l).await {
+                Ok(_) => (),
+                Err(_) => todo!("What errors cna be thrown?"),
+            }
         }
     }
 
@@ -57,145 +180,39 @@ impl ClientAccounts {
         a
     }
 
-    // TODO: process is a very large function
-    // Document this
-    fn process(&mut self, tx: &Transaction) {
-        let client_account = self.clients.entry(tx.client).or_insert(Account::empty());
-
-        if client_account.is_locked {
-            return;
-        }
-
-        match tx.tx_type {
-            TxType::Withdrawal(amount) => {
-                // TODO test this
-                // TODO: f64 comparison should have appropriate precision
-                if client_account.available < amount {
-                    return;
+    fn cmp_without_history(&self, other: &Self) -> bool {
+        for (client, account) in self.clients.iter() {
+            if let Some(other_client) = other.clients.get(client) {
+                if !account.are_same_without_transactions(other_client) {
+                    return false;
                 }
-                client_account.available -= amount;
-            }
-            TxType::Deposit(amount) => {
-                client_account.available += amount;
-            }
-            TxType::Dispute => match client_account.transactions.get_mut(&tx.tx) {
-                Some(tr) => {
-                    // TODO: document this
-                    // cannot dispute an already disputed transaction
-                    if tr.disputed {
-                        return;
-                    }
-
-                    let disputed_amount = match tr.tx_type {
-                        TxType::Withdrawal(_) => {
-                            todo!("Undecided regarding disputes to withdrawals")
-                        }
-                        TxType::Deposit(deposited_amount) => deposited_amount,
-                        // cannot disput a transaction that is neither deposit nor withdrawal
-                        _ => return,
-                    };
-
-                    tr.disputed = true;
-
-                    // TODO: f64 comparisons should take into account the required decimal precision
-                    // do nothing
-                    // TODO: log that when this does not  happens when user deposits,
-                    // then withdraws, then a dispute comes in regarding the initial deposit
-                    // Document necessity of rounding here
-                    if client_account.available >= disputed_amount {
-                        client_account.available -= disputed_amount;
-                        client_account.held += disputed_amount;
-                    }
-                    // do not add transaction to transaction history
-                    return;
-                }
-                // TODO: This dispute referenced a transaction that did not exist
-                // In this situation, do nothing
-                // Ideally, Log the output
-                // do not add transaction to transaction history
-                None => return,
-            },
-
-            TxType::Resolve => match client_account.transactions.get_mut(&tx.tx) {
-                Some(disputed_tx) => {
-                    // TODO: document this
-                    // cannot resolve a transaction that is not being disputed
-                    if !disputed_tx.disputed {
-                        return;
-                    }
-
-                    let disputed_amount = match disputed_tx.tx_type {
-                        TxType::Withdrawal(amount) => amount,
-                        TxType::Deposit(_) => todo!("Undecided regarding disputes to withdrawals"),
-                        // cannot resolve a transaction that is neither deposit nor withdrawal
-                        _ => return,
-                    };
-
-                    disputed_tx.disputed = false;
-
-                    // TODO: f64 comparisons should take into account the required decimal precision
-                    // TODO: this would be a logic bug. It should be logged and analyzed
-                    // Anyways, besides logging, do nothing
-                    // This could happen if a dispute is resolved twice
-                    if client_account.held >= disputed_amount {
-                        client_account.available += disputed_amount;
-                        client_account.held -= disputed_amount;
-                    }
-                    return;
-                }
-                None => {
-                    // Do nothing
-                    // resolve transactions that reference an inexistent transaction
-                    //   should be discarded
-                    return;
-                }
-            },
-            TxType::ChargeBack => {
-                match client_account.transactions.get_mut(&tx.tx) {
-                    Some(disputed_tx) => {
-                        // TODO: document this
-                        // cannot chargeback a transaction that is not being disputed
-                        if !disputed_tx.disputed {
-                            return;
-                        }
-
-                        let disputed_amount = match disputed_tx.tx_type {
-                            TxType::Withdrawal(_) => {
-                                todo!("Undecided regarding disputes to withdrawals")
-                            }
-                            TxType::Deposit(amount) => amount,
-                            // cannot chargeback a transaction that is neither deposit
-                            _ => return,
-                        };
-
-                        // TODO: document this decision
-                        // disputed_tx.disputed = true;
-
-                        // TODO: f64 comparisons should take into account the required decimal precision
-                        if client_account.held >= disputed_amount {
-                            client_account.held -= disputed_amount;
-                            // TODO: this would be a logic bug. It should be logged and analyzed
-                            // Anyways, besides logging, do nothing
-                            // This could happen if a dispute is resolved twice
-                            client_account.is_locked = true;
-                        }
-                        return;
-                    }
-                    None => {
-                        // Do nothing
-                        // resolve transactions that reference an inexistent transaction
-                        //   should be discarded
-                        return;
-                    }
-                }
+            } else {
+                return false;
             }
         }
-        // Is it better to move the transaction here?
-        client_account.transactions.insert(tx.tx, tx.clone());
+        true
     }
 }
 
-impl std::fmt::Display for ClientAccounts {
+impl FromStr for AccountHandler {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut clients = HashMap::new();
+        for l in s.lines().skip(1) {
+            let mut iter = l.split(',');
+            let client_id = ClientId(iter.next().unwrap().parse().unwrap());
+            let available = iter.next().unwrap().trim().parse().unwrap();
+            let held = iter.next().unwrap().trim().parse().unwrap();
+            let _skip_total = iter.next();
+            let is_locked = iter.next().unwrap().trim().parse().unwrap();
+            clients.insert(client_id, Account::new(available, held, vec![], is_locked));
+        }
+        Ok(AccountHandler { clients })
+    }
+}
+
+impl std::fmt::Display for AccountHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "client, available, held, total, locked\n")?;
         for (id, account) in &self.clients {
@@ -206,7 +223,7 @@ impl std::fmt::Display for ClientAccounts {
     }
 }
 
-#[derive(strum_macros::Display, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 enum TxType {
     // TODO: document decimal precision
     // f64 would lose precision at XXXX.YYY
@@ -218,9 +235,31 @@ enum TxType {
     ChargeBack,
 }
 
+impl std::fmt::Display for TxType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let string = match self {
+            TxType::Withdrawal(_) => "withdrawal",
+            TxType::Deposit(_) => "deposit",
+            TxType::Dispute => "dispute",
+            TxType::Resolve => "resolve",
+            TxType::ChargeBack => "chargback",
+        };
+        write!(f, "{string}")
+    }
+}
+
 // TODO: explain reasoning, can't math with them, can't mess them up since they're the same type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ClientId(u16);
+
+impl FromStr for ClientId {
+    // TODO better here
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.trim().parse()?))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TxId(u16);
@@ -347,6 +386,13 @@ impl Transaction {
     }
 }
 
+const PRECISION_FACTOR: f64 = 1e4;
+
+fn round_equals(first: f64, second: f64) -> bool {
+    (first * PRECISION_FACTOR).round() / PRECISION_FACTOR
+        == (second * PRECISION_FACTOR).round() / PRECISION_FACTOR
+}
+
 // TODO: Add check that avaliable + held = total during transaction computation
 // If this invariant holds, there is no need to store total
 #[derive(PartialEq, Debug)]
@@ -357,8 +403,142 @@ struct Account {
     transactions: HashMap<TxId, Transaction>,
 }
 
-
 impl Account {
+    fn process(&mut self, tx: Transaction) {
+        if self.is_locked {
+            return;
+        }
+
+        match tx.tx_type {
+            TxType::Withdrawal(amount) => {
+                // TODO test this
+                // TODO: f64 comparison should have appropriate precision
+                if self.available < amount {
+                    return;
+                }
+                self.available -= amount;
+            }
+            TxType::Deposit(amount) => {
+                self.available += amount;
+            }
+            TxType::Dispute => match self.transactions.get_mut(&tx.tx) {
+                Some(tr) => {
+                    // TODO: document this
+                    // cannot dispute an already disputed transaction
+                    if tr.disputed {
+                        return;
+                    }
+
+                    let disputed_amount = match tr.tx_type {
+                        TxType::Withdrawal(_) => {
+                            todo!("Undecided regarding disputes to withdrawals")
+                        }
+                        TxType::Deposit(deposited_amount) => deposited_amount,
+                        // cannot disput a transaction that is neither deposit nor withdrawal
+                        _ => return,
+                    };
+
+                    tr.disputed = true;
+
+                    // TODO: f64 comparisons should take into account the required decimal precision
+                    // do nothing
+                    // TODO: log that when this does not  happens when user deposits,
+                    // then withdraws, then a dispute comes in regarding the initial deposit
+                    // Document necessity of rounding here
+                    if self.available >= disputed_amount {
+                        self.available -= disputed_amount;
+                        self.held += disputed_amount;
+                    }
+                    // do not add transaction to transaction history
+                    return;
+                }
+                // TODO: This dispute referenced a transaction that did not exist
+                // In this situation, do nothing
+                // Ideally, Log the output
+                // do not add transaction to transaction history
+                None => return,
+            },
+
+            TxType::Resolve => match self.transactions.get_mut(&tx.tx) {
+                Some(disputed_tx) => {
+                    // TODO: document this
+                    // cannot resolve a transaction that is not being disputed
+                    if !disputed_tx.disputed {
+                        return;
+                    }
+
+                    let disputed_amount = match disputed_tx.tx_type {
+                        TxType::Withdrawal(_) => {
+                            todo!("Undecided regarding disputes to withdrawals")
+                        }
+                        TxType::Deposit(amount) => amount,
+                        // cannot resolve a transaction that is neither deposit nor withdrawal
+                        _ => return,
+                    };
+
+                    disputed_tx.disputed = false;
+
+                    // TODO: f64 comparisons should take into account the required decimal precision
+                    // TODO: this would be a logic bug. It should be logged and analyzed
+                    // Anyways, besides logging, do nothing
+                    // This could happen if a dispute is resolved twice
+                    if self.held >= disputed_amount {
+                        self.available += disputed_amount;
+                        self.held -= disputed_amount;
+                    }
+                    return;
+                }
+                None => {
+                    // Do nothing
+                    // resolve transactions that reference an inexistent transaction
+                    //   should be discarded
+                    return;
+                }
+            },
+            TxType::ChargeBack => {
+                match self.transactions.get_mut(&tx.tx) {
+                    Some(disputed_tx) => {
+                        // TODO: document this
+                        // cannot chargeback a transaction that is not being disputed
+                        if !disputed_tx.disputed {
+                            return;
+                        }
+
+                        let disputed_amount = match disputed_tx.tx_type {
+                            TxType::Withdrawal(_) => {
+                                todo!("Undecided regarding disputes to withdrawals")
+                            }
+                            TxType::Deposit(amount) => amount,
+                            // cannot chargeback a transaction that is neither deposit
+                            _ => return,
+                        };
+
+                        // TODO: document this decision
+                        // disputed_tx.disputed = true;
+
+                        // TODO: f64 comparisons should take into account the required decimal precision
+                        if self.held >= disputed_amount {
+                            self.held -= disputed_amount;
+                            // TODO: this would be a logic bug. It should be logged and analyzed
+                            // Anyways, besides logging, do nothing
+                            // This could happen if a dispute is resolved twice
+                            self.is_locked = true;
+                        }
+                        return;
+                    }
+                    None => {
+                        // Do nothing
+                        // resolve transactions that reference an inexistent transaction
+                        //   should be discarded
+                        return;
+                    }
+                }
+            }
+        }
+        // Is it better to move the transaction here?
+        self.transactions.insert(tx.tx, tx.clone());
+    }
+
     fn empty() -> Self {
         Account::unlocked(0.0, 0.0, vec![])
     }
@@ -380,11 +560,24 @@ impl Account {
     fn with_available(available: f64, txs: Vec<Transaction>) -> Self {
         Account::unlocked(available, 0.0, txs)
     }
+
+    fn are_same_without_transactions(&self, other: &Self) -> bool {
+        round_equals(other.available, self.available)
+            && round_equals(other.held, self.held)
+            && other.is_locked == self.is_locked
+    }
 }
 
 impl std::fmt::Display for Account {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:.4}, {:.4}, {:.4}, {}", self.available, self.held, self.available + self.held, self.is_locked)
+        write!(
+            f,
+            "{:.4}, {:.4}, {:.4}, {}",
+            self.available,
+            self.held,
+            self.available + self.held,
+            self.is_locked
+        )
     }
 }
 
@@ -401,18 +594,23 @@ impl std::fmt::Display for Account {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        io::{stderr, stdin, Read, Write},
+        process::Command,
+    };
+    use tokio::runtime::Handle;
 
-    use crate::{Account, ClientAccounts, ClientId, Transaction, TxId, TxType};
+    use crate::{Account, AccountHandler, ClientId, Transaction, TxId, TxType};
 
     struct TestCase {
         inputs: Vec<Transaction>,
-        expected_outputs: ClientAccounts,
+        expected_outputs: AccountHandler,
     }
 
-    impl From<HashMap<ClientId, Account>> for ClientAccounts {
+    impl From<HashMap<ClientId, Account>> for AccountHandler {
         fn from(clients: HashMap<ClientId, Account>) -> Self {
-            ClientAccounts { clients }
+            AccountHandler { clients }
         }
     }
 
@@ -441,13 +639,13 @@ mod tests {
             Transaction::dispute(client_id0, tx_id),
         ];
 
-        let mut actual = ClientAccounts::new();
+        let mut actual = AccountHandler::new();
         actual.consume_all(&inputs);
 
         let mut client_transactions = tx_of_client(&inputs, client_id0);
         client_transactions[0].disputed = true;
 
-        let expected_outputs = ClientAccounts::from(HashMap::from_iter([(
+        let expected_outputs = AccountHandler::from(HashMap::from_iter([(
             client_id0,
             Account::unlocked(0.0, 10.0, client_transactions.clone()),
         )]));
@@ -456,7 +654,7 @@ mod tests {
         actual.process(&Transaction::resolve(client_id0, tx_id));
 
         client_transactions[0].disputed = false;
-        let expected_outputs = ClientAccounts::from(HashMap::from_iter([(
+        let expected_outputs = AccountHandler::from(HashMap::from_iter([(
             client_id0,
             Account::unlocked(10.0, 0.0, client_transactions.clone()),
         )]));
@@ -465,15 +663,91 @@ mod tests {
         actual.process(&Transaction::dispute(client_id0, tx_id));
 
         client_transactions[0].disputed = true;
-        let expected_outputs = ClientAccounts::from(HashMap::from_iter([(
+        let expected_outputs = AccountHandler::from(HashMap::from_iter([(
             client_id0,
             Account::unlocked(0.0, 10.0, client_transactions),
         )]));
         assert_eq!(actual, expected_outputs);
     }
 
+    macro_rules! test_cases {
+        () => {
+            chargeback_withdraws_and_locks_account,
+            disputes_are_idempotent_before_resolve,
+            disputes_are_non_idempotent_after_resolve,
+            unexistent_dispute_reference,
+            unexistent_resolve_reference,
+            resolve_only_decs_respective_held,
+            resolve_decs_held_incs_available,
+            dispute_only_affects_selected_client,
+            withdrawal_doesnt_decrement_held,
+            deposit_doesnt_increment_held,
+            dispute_holds_funds,
+            no_withdrawal_of_held_funds,
+            withdrawal_fails_when_account_is_empty,
+            withdrawal_succeeds_when_same_as_available,
+            withdrawal_succeeds_when_less_than_available,
+            withdrawal_fails_when_more,
+            deposits_accumulate
+        };
+    }
+
+    // TODO: this could be paralelled with macros
     #[test]
-    fn chargeback_withdraws_and_locks_account() {
+    fn run_integration_tests() {
+        let test_cases = [
+            chargeback_withdraws_and_locks_account,
+            disputes_are_idempotent_before_resolve,
+            unexistent_dispute_reference,
+            unexistent_resolve_reference,
+            resolve_only_decs_respective_held,
+            resolve_decs_held_incs_available,
+            dispute_only_affects_selected_client,
+            withdrawal_doesnt_decrement_held,
+            deposit_doesnt_increment_held,
+            dispute_holds_funds,
+            no_withdrawal_of_held_funds,
+            withdrawal_fails_when_account_is_empty,
+            withdrawal_succeeds_when_same_as_available,
+            withdrawal_succeeds_when_less_than_available,
+            withdrawal_fails_when_more,
+            deposits_accumulate,
+        ];
+
+        for i in 0..10 {
+
+        for t in test_cases {
+            let TestCase {
+                inputs,
+                expected_outputs,
+            } = t();
+            let mut contents = format!("type, client, tx, amount\n");
+            contents += &(inputs
+                .iter()
+                .map(|t| format!("{t}"))
+                .intersperse("\n".to_owned())
+                .collect::<String>());
+            std::fs::write("temp.csv", contents).unwrap();
+            let result = String::from_utf8(
+                Command::new("cargo")
+                    .arg("run")
+                    .arg("--")
+                    .arg("temp.csv")
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap();
+            let actual: AccountHandler = result.parse().unwrap();
+            assert!(actual.cmp_without_history(&expected_outputs));
+        }
+
+        stderr().write(format!("finnished test case run number{i}").as_bytes());
+        }
+
+    }
+
+    fn chargeback_withdraws_and_locks_account() -> TestCase {
         let client_id0 = ClientId(0);
         let initial_amount = 10.0;
         let tx_id = TxId(0);
@@ -496,13 +770,14 @@ mod tests {
             Account::new(0.0, 0.0, client_transactions, true),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, ClientAccounts::from(expected_outputs));
+
+        TestCase {
+            inputs,
+            expected_outputs: expected_outputs.into(),
+        }
     }
 
-    #[test]
-    fn disputes_are_idempotent_before_resolve() {
+    fn disputes_are_idempotent_before_resolve() -> TestCase {
         let client_id0 = ClientId(0);
         let initial_amount = 10.0;
         let tx_id = TxId(0);
@@ -520,13 +795,13 @@ mod tests {
             Account::unlocked(0.0, 10.0, client_transactions),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, ClientAccounts::from(expected_outputs));
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn unexistent_resolve_reference() {
+    fn unexistent_resolve_reference() -> TestCase {
         let client_id0 = ClientId(0);
         let initial_amount = 10.0;
         let inputs = vec![
@@ -543,13 +818,13 @@ mod tests {
             Account::unlocked(0.0, 10.0, client_transactions),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, ClientAccounts::from(expected_outputs));
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn unexistent_dispute_reference() {
+    fn unexistent_dispute_reference() -> TestCase {
         let client_id0 = ClientId(0);
         let initial_amount = 10.0;
         let inputs = vec![
@@ -562,13 +837,13 @@ mod tests {
             Account::with_available(initial_amount, tx_of_client(&inputs, client_id0)),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, ClientAccounts::from(expected_outputs));
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn resolve_only_decs_respective_held() {
+    fn resolve_only_decs_respective_held() -> TestCase {
         let client_id0 = ClientId(0);
         let client_id1 = ClientId(1);
         let disputed_id1 = TxId(3);
@@ -605,13 +880,13 @@ mod tests {
             ),
         ]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, ClientAccounts::from(expected_outputs));
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn resolve_decs_held_incs_available() {
+    fn resolve_decs_held_incs_available() -> TestCase {
         let client_id = ClientId(0);
         let disputed_id = TxId(1);
         let disputed_amount = 1.0;
@@ -626,13 +901,13 @@ mod tests {
             Account::with_available(disputed_amount, tx_of_client(&inputs, client_id)),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn dispute_only_affects_selected_client() {
+    fn dispute_only_affects_selected_client() -> TestCase {
         let client_id0 = ClientId(0);
         let client_id1 = ClientId(1);
         let disputed_id1 = TxId(3);
@@ -661,16 +936,13 @@ mod tests {
             ),
         ]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(
-            actual.eject_clients(),
-            ClientAccounts::from(expected_outputs).eject_clients()
-        );
+        TestCase {
+            inputs,
+            expected_outputs: expected_outputs.into(),
+        }
     }
 
-    #[test]
-    fn withdrawal_doesnt_decrement_held() {
+    fn withdrawal_doesnt_decrement_held() -> TestCase {
         let client_id = ClientId(0);
         let disputed_id = TxId(1);
         let initial_amount = 10.0;
@@ -696,13 +968,13 @@ mod tests {
             ),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn deposit_doesnt_increment_held() {
+    fn deposit_doesnt_increment_held() -> TestCase {
         let client_id = ClientId(0);
         let disputed_id = TxId(1);
         let initial_amount = 10.0;
@@ -727,13 +999,13 @@ mod tests {
             ),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn dispute_holds_funds() {
+    fn dispute_holds_funds() -> TestCase {
         let client_id = ClientId(0);
         let deposit_id = TxId(1);
         let initial_amount = 10.0;
@@ -752,13 +1024,13 @@ mod tests {
             Account::unlocked(initial_amount, disputed_amount, client_transactions),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn no_withdrawal_of_held_funds() {
+    fn no_withdrawal_of_held_funds() -> TestCase {
         let client_id = ClientId(0);
         let deposit_id = TxId(0);
         let initial_amount = 10.0;
@@ -783,13 +1055,13 @@ mod tests {
             ),
         )]);
 
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn withdrawal_fails_when_account_is_empty() {
+    fn withdrawal_fails_when_account_is_empty() -> TestCase {
         let client_id = ClientId(0);
         let inputs = vec![Transaction::withdrawal(client_id, TxId(1), 1.0)];
         let expected_outputs = HashMap::from_iter([(
@@ -797,13 +1069,13 @@ mod tests {
             // not added to history
             Account::with_available(0.0, vec![]),
         )]);
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn withdrawal_succeeds_when_same_as_available() {
+    fn withdrawal_succeeds_when_same_as_available() -> TestCase {
         let client_id = ClientId(0);
         let val_1 = 1.2;
         let inputs = vec![
@@ -812,13 +1084,13 @@ mod tests {
         ];
         let expected_outputs =
             HashMap::from_iter([(client_id, Account::with_available(0.0, inputs.clone()))]);
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn withdrawal_succeeds_when_less_than_available() {
+    fn withdrawal_succeeds_when_less_than_available() -> TestCase {
         let client_id = ClientId(0);
         let val_1 = 1.2;
         let withdraw = val_1 - 1.0;
@@ -830,13 +1102,13 @@ mod tests {
             client_id,
             Account::with_available(val_1 - withdraw, tx_of_client(&inputs, client_id)),
         )]);
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn withdrawal_fails_when_more() {
+    fn withdrawal_fails_when_more() -> TestCase {
         let client_id = ClientId(0);
         let val_1 = 1.2;
         let withdraw = val_1 + 1.0;
@@ -848,13 +1120,13 @@ mod tests {
             client_id,
             Account::with_available(val_1, vec![inputs[0].clone()]),
         )]);
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 
-    #[test]
-    fn deposits_accumulate() {
+    fn deposits_accumulate() -> TestCase {
         let client_id = ClientId(0);
         let val_1 = 1.2;
         let val_2 = val_1 + 1.0;
@@ -867,8 +1139,9 @@ mod tests {
             client_id,
             Account::with_available(val_1 + val_2, tx_of_client(&inputs, client_id)),
         )]);
-        let mut actual = ClientAccounts::new();
-        actual.consume_all(&inputs);
-        assert_eq!(actual, expected_outputs.into());
+        TestCase {
+            expected_outputs: expected_outputs.into(),
+            inputs,
+        }
     }
 }
