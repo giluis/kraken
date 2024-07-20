@@ -218,23 +218,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49f1f14873335454500d59611f1cf4a4b0f786f9ac11f4312a78e4cf2566695b"
 
 [[package]]
-name = "krakentet"
-version = "0.1.0"
-dependencies = [
- "csv",
- "futures",
- "itertools",
- "paste",
- "pretty_assertions",
- "serde",
- "serde_derive",
- "strum",
- "strum_macros",
- "tokio",
- "tokio-macros",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.155"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -371,6 +354,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c82cf8cff14456045f55ec4241383baeff27af886adb72ffb2162f99911de0fd"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "rust_test"
+version = "0.1.0"
+dependencies = [
+ "csv",
+ "futures",
+ "itertools",
+ "paste",
+ "pretty_assertions",
+ "serde",
+ "serde_derive",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tokio-macros",
 ]
 
 [[package]]
