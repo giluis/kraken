@@ -1,19 +1,15 @@
 use std::{collections::HashMap, num::ParseIntError, str::FromStr};
 
-use crate::round_equals;
+use crate::{round_equals, PRECISION_FACTOR};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TxId(pub u16);
+pub struct TxId(pub u32);
 
-// TODO: explain reasoning, can't math with them, can't mess them up since they're the same type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(pub u16);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TxType {
-    // TODO: document decimal precision
-    // f64 would lose precision at XXXX.YYY
-    // f64 allows much larger numbers XXXXXXXXXXX.YYYY
     Withdrawal(f64),
     Deposit(f64),
     Dispute,
@@ -21,8 +17,7 @@ pub enum TxType {
     ChargeBack,
 }
 
-impl TxType {
-}
+impl TxType {}
 
 impl std::fmt::Display for TxType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,18 +40,16 @@ impl FromStr for ClientId {
     }
 }
 
+// ask me how this can be improved
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transaction {
     tx_type: TxType,
     client: ClientId,
     tx: TxId,
-    // TODO: document and test disputed transactions
-    // TODO: type system allows Dispute/Resolve/Chargback
-    // transactions to be disputed, which is not right
-    disputed: bool,
+    is_disputed: bool,
 }
 
-// TODO: this functions performance can be improved
+// ask me how this can be improved
 impl std::fmt::Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut result = format!("{}, {:.4}, {:.4}", self.tx_type, self.client.0, self.tx.0);
@@ -69,14 +62,13 @@ impl std::fmt::Display for Transaction {
     }
 }
 
-// TODO: ask me how this can be improved
+// ask me how this can be improved
 impl FromStr for Transaction {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let fields: Vec<_> = s.split(',').collect();
-        // TODO: handle panics here
-        if fields.is_empty(){
+        if fields.is_empty() {
             return Err("Cannot parse empty transaction string".to_owned());
         }
 
@@ -93,7 +85,7 @@ impl FromStr for Transaction {
                 .get(2)
                 .ok_or("Incorrect transaction formatting")?
                 .trim()
-                .parse::<u16>()
+                .parse::<u32>()
                 .map_err(|e| e.to_string())?,
         );
 
@@ -129,24 +121,23 @@ impl FromStr for Transaction {
             tx,
             tx_type,
             // all transactions start out as not disputed
-            disputed: false,
+            is_disputed: false,
         })
     }
 }
 
-// TODO: where should I assert that value isn't zero?
 impl Transaction {
     pub fn new(client_id: ClientId, tx_id: TxId, tx_type: TxType) -> Self {
         Self {
             client: client_id,
             tx: tx_id,
-            disputed: false,
+            is_disputed: false,
             tx_type,
         }
     }
 
     pub fn set_disputed(&mut self, disputed: bool) {
-        self.disputed = disputed;
+        self.is_disputed = disputed;
     }
 
     pub fn client(&self) -> ClientId {
@@ -167,7 +158,15 @@ pub struct Account {
 }
 
 impl Account {
-    // TODO: make this functoin clearer and smaller
+    /**
+     * Rounds available and held to 4 decimal places.
+     */
+    pub fn round(&mut self) {
+        self.available = (self.available * PRECISION_FACTOR).round() / PRECISION_FACTOR;
+        self.held = (self.held * PRECISION_FACTOR).round() / PRECISION_FACTOR;
+    }
+
+    // ask me how this can be improved
     pub fn process(&mut self, tx: Transaction) {
         if self.is_locked {
             return;
@@ -175,59 +174,57 @@ impl Account {
 
         match tx.tx_type {
             TxType::Withdrawal(amount) => {
-                // TODO test this
-                // TODO: f64 comparison should have appropriate precision
                 if self.available < amount {
                     return;
                 }
                 self.available -= amount;
+                self.transactions.insert(tx.tx, tx.clone());
             }
             TxType::Deposit(amount) => {
                 self.available += amount;
+                self.transactions.insert(tx.tx, tx.clone());
             }
             TxType::Dispute => match self.transactions.get_mut(&tx.tx) {
-                Some(tr) => {
-                    // TODO: document this
-                    // cannot dispute an already disputed transaction
-                    if tr.disputed {
+                Some(referenced_tx) => {
+                    // Cannot dispute an already disputed transaction
+                    // Do nothing
+                    if referenced_tx.is_disputed {
                         return;
                     }
 
-                    let disputed_amount = match tr.tx_type {
+                    let disputed_amount = match referenced_tx.tx_type {
                         TxType::Withdrawal(_) => {
-                            todo!("Undecided regarding disputes to withdrawals")
+                            // Though the assignment is not explicitly against it,
+                            // i decided that withdrawal transactions cannot be disputed
+                            // So, do nothing
+                            return;
                         }
                         TxType::Deposit(deposited_amount) => deposited_amount,
-                        // cannot disput a transaction that is neither deposit nor withdrawal
+                        // Cannot disput a transaction that is neither deposit nor withdrawal
                         _ => return,
                     };
 
-                    tr.disputed = true;
+                    referenced_tx.is_disputed = true;
 
-                    // TODO: f64 comparisons should take into account the required decimal precision
-                    // do nothing
-                    // TODO: log that when this does not  happens when user deposits,
-                    // then withdraws, then a dispute comes in regarding the initial deposit
-                    // Document necessity of rounding here
                     if self.available >= disputed_amount {
                         self.available -= disputed_amount;
                         self.held += disputed_amount;
+                    } else {
+                        // This could happen if a dispute is referencing funds that have already been withdrawn
+                        // Assignment isn't clear here on what to do. I opt to do nothing
+                        return;
                     }
-                    // do not add transaction to transaction history
-                    return;
                 }
-                // TODO: This dispute referenced a transaction that did not exist
-                // In this situation, do nothing
-                // Ideally, Log the output
-                // do not add transaction to transaction history
+                // This dispute referenced a transaction that did not exist
+                // Do nothing
                 None => return,
             },
 
             TxType::Resolve => match self.transactions.get_mut(&tx.tx) {
                 Some(disputed_tx) => {
-                    // TODO: document this
-                    // cannot resolve a transaction that is not being disputed
-                    if !disputed_tx.disputed {
+                    // Cannot resolve a transaction that is not being disputed
+                    // Do nothing
+                    if !disputed_tx.is_disputed {
                         return;
                     }
 
@@ -236,35 +233,35 @@ impl Account {
                             todo!("Undecided regarding disputes to withdrawals")
                         }
                         TxType::Deposit(amount) => amount,
-                        // cannot resolve a transaction that is neither deposit nor withdrawal
+                        // Cannot resolve a transaction that is neither deposit nor withdrawal
+                        // Do nothing
                         _ => return,
                     };
 
-                    disputed_tx.disputed = false;
+                    disputed_tx.is_disputed = false;
 
-                    // TODO: f64 comparisons should take into account the required decimal precision
-                    // TODO: this would be a logic bug. It should be logged and analyzed
-                    // Anyways, besides logging, do nothing
-                    // This could happen if a dispute is resolved twice
                     if self.held >= disputed_amount {
                         self.available += disputed_amount;
                         self.held -= disputed_amount;
+                    } else {
+                        // This would be a logic bug.
+                        // It could happen if a dispute was resolved twice
+                        // That shouldn't happen
+                        // I opt to do nothing in this case.
+                        // Ideally, this would be logged for analysis
+                        return;
                     }
-                    return;
                 }
-                None => {
-                    // Do nothing
-                    // resolve transactions that reference an inexistent transaction
-                    //   should be discarded
-                    return;
-                }
+                //  Cannot resolve an innexistent transaction
+                //  Do nothing
+                None => return,
             },
             TxType::ChargeBack => {
                 match self.transactions.get_mut(&tx.tx) {
                     Some(disputed_tx) => {
-                        // TODO: document this
-                        // cannot chargeback a transaction that is not being disputed
-                        if !disputed_tx.disputed {
+                        // Cannot chargeback a transaction that is not being disputed
+                        // Do nothing
+                        if !disputed_tx.is_disputed {
                             return;
                         }
 
@@ -273,33 +270,37 @@ impl Account {
                                 todo!("Undecided regarding disputes to withdrawals")
                             }
                             TxType::Deposit(amount) => amount,
-                            // cannot chargeback a transaction that is neither deposit
+                            // Cannot chargeback a transaction that is neither deposit
+                            // Do nothing
                             _ => return,
                         };
 
-                        // TODO: document this decision
+                        // Works either way, since account will be locked anyway
                         // disputed_tx.disputed = true;
 
-                        // TODO: f64 comparisons should take into account the required decimal precision
                         if self.held >= disputed_amount {
                             self.held -= disputed_amount;
-                            // TODO: this would be a logic bug. It should be logged and analyzed
-                            // Anyways, besides logging, do nothing
-                            // This could happen if a dispute is resolved twice
-                            self.is_locked = true;
+                        } else {
+                            // This would be a logic bug.
+                            // It could if a dispute was resolved and chargedback
+                            // The assignemnt does not mention what to do in this situation
+                            return;
                         }
-                        return;
+                        // Locking should happen either way
+                        // either because of chargeback
+                        // or bug mentioned above
+                        self.is_locked = true;
                     }
-                    None => {
-                        // Do nothing
-                        // resolve transactions that reference an inexistent transaction
-                        //   should be discarded
-                        return;
-                    }
+                    // Chargebacks that cannot reference an inexistent transaction
+                    // Do nothing
+                    None => return,
                 }
             }
         }
-        self.transactions.insert(tx.tx, tx.clone());
+        // Whenever a transaction is correctly processed, 
+        // its values should be rounded to the appropriate precision.
+        // This prevents precision errors from accumulating
+        self.round()
     }
 
     pub fn empty() -> Self {

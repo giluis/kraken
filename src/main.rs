@@ -1,6 +1,5 @@
-#![feature(hash_set_entry)]
 #![feature(iter_intersperse)]
-#![feature(concat_idents)]
+
 use std::{
     collections::HashMap,
     fs::File,
@@ -9,45 +8,32 @@ use std::{
 
 use tokio::task::JoinHandle;
 
-mod model;
 
 use model::{Account, ClientId};
 
+mod model; 
+
 type TokioSender<T> = tokio::sync::mpsc::Sender<T>;
 
-// TODO: explore cache-friendlier alternatives
-//      perhaps a matrix that covered all the transactions that happnned X seconds ago, where X the typicall amount that disputes occurs
-// TODO: Explain that dispute, resolve, and cashback are not stored, because they have no id
-// TODO: sinalize which transactions have gone wrong with errors
-// TODO: use faster hashmaps
-// TODO: document what would be a better data model for dispute
-// resolve and cashback transactions
-// TODO: mention pretty_printing bug
-// TODO: explain tests need to be underperformant in order to be pure
-// TODO: explain decision regarding disputes for withdrawals
-// resolves should increment held and decrement available. this is applicable to disputes
-// assignment is not clear on what to do this
-// TODO: explain lack of Serde
-
 #[tokio::main]
-async fn main() {
-    let file_name = std::env::args().nth(1).unwrap();
-    let f = File::open(file_name).unwrap();
-    let reader = BufReader::new(f);
-    let lines = reader.lines().skip(1);
+async fn main() -> std::io::Result<()>{
+    let file_name = std::env::args().nth(1).expect("Please input filename as argument");
+    let file = File::open(file_name).unwrap();
+    let reader = BufReader::new(file).lines().skip(1);
 
     let mut handler = AccountHandler::new();
 
-    for l in lines {
+    for l in reader {
         let l = l.unwrap();
         handler.process(l).await;
     }
 
     let result = handler.await_and_eject().await.to_string();
-    let _ = stdout().write(result.as_bytes()).unwrap();
+    let _ = stdout().write(result.as_bytes())?;
+    Ok(())
 }
 
-fn get_id(line: &str) -> ClientId {
+fn get_client_id(line: &str) -> ClientId {
     line.split(',').nth(1).unwrap().parse().unwrap()
 }
 
@@ -64,7 +50,7 @@ impl AccountHandler {
     }
 
     async fn process(&mut self, tx_str: String) {
-        let id = get_id(&tx_str);
+        let id = get_client_id(&tx_str);
         let entry = self.clients.entry(id).or_insert({
             let (sender, mut receiver) = tokio::sync::mpsc::channel(100);
             (
@@ -84,10 +70,11 @@ impl AccountHandler {
                 }),
             )
         });
-        match entry.0.send(tx_str).await {
-            Ok(_) => (),
-            Err(_) => todo!("What errors cna be thrown?"),
-        }
+        entry
+            .0
+            .send(tx_str)
+            .await
+            .expect("Unexpected error on receiver side");
     }
 
     async fn await_and_eject(self) -> ClientAccounts {
@@ -103,19 +90,6 @@ impl AccountHandler {
 
 #[derive(Debug)]
 struct ClientAccounts(Vec<(ClientId, Account)>);
-
-impl PartialEq for ClientAccounts {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self.0.iter().zip(other.0.iter()).all(
-                |((client_id1, account1), (client_id2, account2))| {
-                    client_id1 == client_id2 && account1.are_same_without_transactions(account2)
-                },
-            )
-    }
-}
-
-impl ClientAccounts {}
 
 impl std::fmt::Display for ClientAccounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -133,21 +107,23 @@ fn round_equals(first: f64, second: f64) -> bool {
         == (second * PRECISION_FACTOR).round() / PRECISION_FACTOR
 }
 
-/**
- * TODO:
- * - test varying precisions for amounts in CSV files
- * - test spacing in outputs
- * - test negative values are not allowed
- * - test dispute, resolve and chargeback can only reference
- *      transactions specific to the client they reference
- */
-
 #[cfg(test)]
 mod integration_tests {
     use crate::ClientAccounts;
 
     use super::test_cases::*;
     use std::process::Command;
+
+    impl PartialEq for ClientAccounts {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.len() == other.0.len()
+                && self.0.iter().zip(other.0.iter()).all(
+                    |((client_id1, account1), (client_id2, account2))| {
+                        client_id1 == client_id2 && account1.are_same_without_transactions(account2)
+                    },
+                )
+        }
+    }
 
     #[test]
     fn run_integration_tests() {
@@ -174,7 +150,7 @@ mod integration_tests {
         // increases statistical likelyness
         // of undesired task ordering
         // acceptable substitute for accurate async testing
-        for _ in 0..4 {
+        for _ in 0..12 {
             for t in test_cases {
                 let TestCase {
                     inputs,
